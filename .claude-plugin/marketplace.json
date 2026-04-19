@@ -1,0 +1,16 @@
+{
+  "name": "snowflake-plugins",
+  "owner": {
+    "name": "snowme34"
+  },
+  "metadata": {
+    "description": "Collection of short, pratical, and personal Claude Code plugins"
+  },
+  "plugins": [
+    {
+      "name": "proof-read",
+      "source": "./plugins/proof-read",
+      "description": "Proofread markdown documents in four passes: auto-fix typos and grammar, then annotate sentence- and document-level issues with review tags."
+    }
+  ]
+}

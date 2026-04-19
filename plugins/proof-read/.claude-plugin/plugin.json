@@ -1,0 +1,5 @@
+{
+  "name": "proof-read",
+  "description": "Proofread markdown documents in four passes: auto-fix typos and grammar, then annotate sentence- and document-level issues with review tags.",
+  "version": "1.0.0"
+}

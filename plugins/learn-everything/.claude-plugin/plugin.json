@@ -1,0 +1,5 @@
+{
+  "name": "learn-everything",
+  "description": "Turn any video, audio, or text into structured learning notes. Transcribes with GPU-accelerated Whisper, splits into semantic chapters with exact timestamps, and distills active-recall takeaways.",
+  "version": "1.0.0"
+}

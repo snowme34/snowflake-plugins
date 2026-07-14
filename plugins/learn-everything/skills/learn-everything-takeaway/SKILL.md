@@ -64,8 +64,10 @@ If `--questions` provided: answer each explicitly first, then add mode-appropria
 
 ## Step 3: Load reference example
 
-Read `${CLAUDE_SKILL_DIR}/examples/{TYPE}.md`. If file does not
-exist, skip this step. Use as quality target, not template.
+Read `${CLAUDE_SKILL_DIR}/examples/{TYPE}.md`. If the file does not exist, skip this step.
+It is a deliberately thin worked example: the `<!-- -->` annotations are the point — each
+names the transferable principle behind its section. Take the principles, not the topic.
+Quality target, not template.
 
 ## Step 4: Decide whether the idea has *shape*
 

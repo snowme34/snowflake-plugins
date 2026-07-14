@@ -30,8 +30,12 @@ Transcript: $ARGUMENTS
 
 ## Step 1: Read transcript
 
-Load TRANSCRIPT_PATH. Extract header fields: `TITLE`, `DURATION`, `LANG`, `SOURCE`, `QUALITY`.
+Load TRANSCRIPT_PATH. Extract header fields: `TITLE`, `DURATION`, `LANG`, `SOURCE`, `COVERAGE`.
 Collect all timestamped lines (`[H:]M:SS text`) as the transcript body.
+
+If `SOURCE` names a recogniser (`…-whisper/…` or `yt-dlp-auto/…`), the wording is machine-made:
+proper nouns and technical terms are the first thing it gets wrong. Quote it as it stands — do
+not silently "correct" it — but do not build a claim on a single odd-looking term.
 
 ## Step 2: Detect content type
 

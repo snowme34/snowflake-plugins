@@ -4,7 +4,7 @@ description: >
   Fetch a transcript from any video URL or local file. Tries platform subtitles first;
   falls back to Whisper speech recognition (GPU-accelerated on Apple Silicon) if unavailable.
 allowed-tools: Bash Read
-argument-hint: <url-or-file> [--lang LANG] [--whisper-model large-v3|medium|small] [--cookies PATH] [--output PATH]
+argument-hint: <url-or-file> [--lang LANG] [--model tiny|small|medium|large-v3|large-v3-turbo] [--cookies PATH] [--output PATH]
 effort: medium
 ---
 
@@ -19,106 +19,111 @@ Input: $ARGUMENTS
 | Bilibili cookies | `~/.claude/my-auth/cookies-bilibili.txt` |
 | Default output | `./tmp-claude/video-grab/{VIDEO_ID}/transcript.txt` |
 
-## Step 0: Check deps
-
-```bash
-~/.claude/my-venvs/video-learn/bin/python -c "import yt_dlp; print('deps=ok')" 2>&1
-command -v ffmpeg >/dev/null 2>&1 && echo "ffmpeg=ok" || echo "ffmpeg=missing"
-```
-
-If either check fails: tell user to run `learn-everything:video-dl-setup` skill first. Stop.
-
 ## Step 1: Parse arguments
 
-- `SOURCE` — URL or local file path (required)
-- `--lang LANG` — language hint (e.g. `en`, `zh`, `ja`)
-- `--whisper-model MODEL` — model for speech recognition (default: `large-v3`). Only drop to a
-  smaller model if the user asks for speed over accuracy.
-- `--cookies PATH` — cookies file for sites requiring auth
-- `--output PATH` — override default output path
+- `INPUT` — the URL or local file path to transcribe (required)
+- `--lang LANG` — the language being spoken (`en`, `zh`, `ja`). Pass it whenever you know it.
+- `--model MODEL` — default `large-v3`. Go smaller only if the user asks for speed over accuracy.
+- `--cookies PATH` — cookies file for sites that need auth
+- `--output PATH` — override the default output path
 
-The script picks the backend itself: `mlx-whisper` (Metal GPU) on Apple Silicon, `faster-whisper`
-(CPU) elsewhere. Force one with `--backend mlx|faster` only when debugging.
+Everything else the script decides for itself: captions vs speech recognition, GPU vs CPU backend,
+chunking, worker count. `--chunk-minutes`, `--workers` and `--backend` exist for debugging one of
+those decisions; leave them alone.
 
-## Step 0.5: Budget the runtime
+If INPUT is a Bilibili URL and `--cookies` was not given, default to
+`~/.claude/my-auth/cookies-bilibili.txt`. If that file is missing, stop and say:
+> ⚠ Bilibili requires cookies. Run the `learn-everything:video-dl-setup` skill for instructions.
 
-Speech recognition is slow. Estimate before launching:
+## Step 2: Check the dependencies this run actually needs
 
-| Backend | Throughput (large-v3) | 60 min of audio |
-|---|---|---|
-| mlx-whisper (Apple Silicon GPU) | ~3x realtime | ~20 min |
-| faster-whisper (CPU) | ~0.8x realtime | ~75 min |
-
-For a local file longer than ~10 min, use `scripts/transcribe_chunked.py` instead of Step 2.
-It splits with ffmpeg, transcribes chunk by chunk, offsets timestamps back onto the original
-timeline, and caches each finished chunk — so no single command outlives its timeout
-(`Bash` caps at 10 min, and background tasks may be reaped earlier), and an interrupted run
-resumes for free.
+A URL needs yt-dlp. A local file never touches it. Both need ffmpeg, and both need a Whisper
+backend unless the captions happen to exist.
 
 ```bash
-~/.claude/my-venvs/video-learn/bin/python \
-  "${CLAUDE_SKILL_DIR}/scripts/transcribe_chunked.py" \
-  AUDIO --output OUTPUT_PATH --chunk-minutes 5 --workers 3 \
-  [--lang LANG] [--model MODEL] [--max-chunks N]
+command -v ffmpeg >/dev/null && echo "ffmpeg=ok" || echo "ffmpeg=MISSING"
+~/.claude/my-venvs/video-learn/bin/python - <<'PY'
+import importlib.util as u
+print("whisper=ok" if u.find_spec("mlx_whisper") or u.find_spec("faster_whisper") else "whisper=MISSING")
+print("yt_dlp=ok" if u.find_spec("yt_dlp") else "yt_dlp=MISSING")
+PY
 ```
 
-It transcribes `--workers` chunks concurrently, which matters more than it looks: one Whisper
-process leaves the GPU mostly idle, so 3 in parallel run several times faster than 1 (measured on
-an M4: 1.7x realtime → 7.4x). Keep chunks small enough to parallelize (5 min is a good default) and
-cap a pass with `--max-chunks` so it lands inside the timeout, then re-invoke the identical command
-until it prints `ALL_CHUNKS_DONE`. Skip to Step 3 once it does.
+`ffmpeg` or `whisper` missing → stop, tell the user to run `learn-everything:video-dl-setup`.
+`yt_dlp` missing → only a problem if INPUT is a URL.
 
-For **dense continuous speech** (lectures), budget ~2x the throughput above; Whisper decodes token
-by token, so a talky video is far slower than a sparse one of the same length. Measure one chunk
-before promising the user a number.
+## Step 3: Pick VIDEO_ID and the output path
 
-If SOURCE is a Bilibili URL and `--cookies` not provided:
-default to `~/.claude/my-auth/cookies-bilibili.txt`. If missing:
-> ⚠ Bilibili requires cookies. Run the `learn-everything:video-dl-setup` skill for instructions.
-Stop.
+- YouTube: the `v=` param, or the last path segment of a `youtu.be/` URL
+- Bilibili: the `BV…` id in the path
+- Local file: the filename without its extension
+- Anything else: `~/.claude/my-venvs/video-learn/bin/yt-dlp --get-id "INPUT"`
 
-## Step 1.5: Fetch metadata (URLs only)
+`OUTPUT_PATH` = `--output` if given, else `./tmp-claude/video-grab/{VIDEO_ID}/transcript.txt`.
 
-Skip if SOURCE is a local file path.
+## Step 4: Run it
 
-Invoke `learn-everything:video-dl-download` skill: `SOURCE --mode metadata [--cookies PATH]`
+**Quote every path.** The files this gets pointed at have spaces and CJK characters in their
+names; an unquoted `INPUT` splits into two arguments and argparse rejects it.
 
-Print the result immediately.
+Captions come back in seconds, so a URL can run in the foreground. Speech recognition does not:
+it runs at roughly 5–8× realtime on Apple Silicon and slower than realtime on CPU, so an hour of
+audio takes many minutes and will outlive the foreground limit. **A local file always means speech
+recognition — run it in the background.** So will a URL with no captions, which you cannot know in
+advance; if a foreground URL run is still going after a minute, kill it and relaunch it this way.
 
-## Step 2: Extract VIDEO_ID and fetch transcript
-
-Extract VIDEO_ID from SOURCE:
-- YouTube: parse `v=` param or last path segment of `youtu.be/` URL
-- Bilibili: extract `BV[alphanumeric]+` from URL path
-- Local file: filename without extension
-- Fallback: `~/.claude/my-venvs/video-learn/bin/yt-dlp --get-id SOURCE`
-
-Determine output path:
-- If `--output PATH` given: use it
-- Otherwise: `./tmp-claude/video-grab/{VIDEO_ID}/transcript.txt`
+Foreground (URL, expecting captions):
 
 ```bash
-mkdir -p $(dirname OUTPUT_PATH)
+mkdir -p "$(dirname "OUTPUT_PATH")"
 ~/.claude/my-venvs/video-learn/bin/python \
   "${CLAUDE_SKILL_DIR}/scripts/get_transcript.py" \
-  SOURCE [--lang LANG] [--model WHISPER_MODEL] \
-  [--cookies PATH] \
-  --output OUTPUT_PATH
+  "INPUT" --output "OUTPUT_PATH" [--lang LANG] [--model MODEL] [--cookies PATH]
 ```
 
-Read the saved file after the command completes. Parse header fields:
-`SOURCE`, `QUALITY`, `WARN`, `TITLE`, `DURATION`
+Background (local file, or a URL that fell back to Whisper) — use the Bash tool's
+`run_in_background`, and add `2>&1` so the `PROGRESS:` lines land in the same log:
 
-## Step 3: Report quality
-
-Print:
+```bash
+mkdir -p "$(dirname "OUTPUT_PATH")"
+~/.claude/my-venvs/video-learn/bin/python \
+  "${CLAUDE_SKILL_DIR}/scripts/get_transcript.py" \
+  "INPUT" --output "OUTPUT_PATH" [--lang LANG] [--model MODEL] 2>&1
 ```
-Transcript: METHOD, lang=LANG, quality=QUALITY, DURATION min
-VIDEO_ID: <id>
+
+Then wait for the task to finish. Do not poll in a shell loop and do not re-launch it — the
+harness tells you when a background task exits. `PROGRESS: done/total` in the log says how far
+along it is if the user asks.
+
+**If the run dies** (killed, timed out, machine slept): re-run the identical command. Finished
+chunks are cached, and it picks up from where it stopped. This is the *only* situation in which
+re-running helps.
+
+## Step 5: Report
+
+The command prints the transcript header to stdout. Note that the header's `SOURCE` field is the
+*engine* that produced the transcript, not the input you gave it — do not report it as the origin.
+
+```
+Transcript: {header SOURCE}, lang={LANG}, coverage={COVERAGE}, {DURATION}s
+Input: INPUT
 Path: OUTPUT_PATH
 ```
 
-If METHOD contains `whisper`:
-> ⚠ Used speech recognition (METHOD). Auto-generated — verify accuracy.
+| Header | Meaning | What you must do |
+|---|---|---|
+| `SOURCE: yt-dlp/…` | a human wrote these subtitles | trust the wording |
+| `SOURCE: yt-dlp-auto/…` | YouTube's recogniser wrote them | ⚠ tell the user it is machine-generated |
+| `SOURCE: …-whisper/…` | Whisper wrote them | ⚠ tell the user it is machine-generated |
+| `WARN: …` | audio is missing from the transcript | print it verbatim, then read the rule below |
+| no `DURATION` line | the source would not say how long it is | say so; do not report a duration of 0 |
 
-If WARN present: print it.
+`COVERAGE` is the fraction of the audio some transcript line accounts for — **not** how correct the
+words are. A recogniser that mishears the same technical term for an hour still scores 1.00. Never
+offer a high COVERAGE as evidence that the transcript is accurate.
+
+**A `WARN` on a run that completed does not mean "try again."** The command already transcribed
+every chunk; re-running repeats all of it and returns the same answer. `stops at …` or `a 300s
+stretch … produced no text` on a completed run means that stretch of audio has no speech in it —
+silence, music, or a truncated source file. Tell the user which stretch, and carry on with the
+transcript you have.

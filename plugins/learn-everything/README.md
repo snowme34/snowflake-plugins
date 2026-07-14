@@ -37,16 +37,22 @@ Transcription picks its backend automatically:
 
 | Platform | Backend | Throughput (large-v3) |
 |---|---|---|
-| Apple Silicon | `mlx-whisper` (Metal GPU) | ~3x realtime, ~13x with `--workers 3` |
-| Everything else | `faster-whisper` (CPU) | ~0.8x realtime |
+| Apple Silicon | `mlx-whisper` (Metal GPU) | ~3x realtime per process, ~3 processes at once |
+| Everything else | `faster-whisper` (CPU) | ~0.8x realtime, single process (it already uses every core) |
 
-Two things worth knowing, because they cost real wall-clock time if you get them wrong:
+**Dense speech is much slower than sparse speech of the same length.** Whisper decodes token by token, so an hour of a talkative lecturer costs far more than an hour of a recording with pauses and music. Measure before promising anyone a finish time.
 
-**One Whisper process does not saturate the GPU.** It spends most of its life waiting. Running three chunks side by side is several times the throughput of one — measured on an M4, 1.7x realtime became 13.6x. This is what `--workers` is for, and it is the single biggest speed lever in the plugin.
+### Chunking
 
-**Dense speech is much slower than sparse speech of the same length.** Whisper decodes token by token, so an hour of a talkative lecturer costs far more than an hour of a recording with pauses and music. Measure one chunk before promising anyone a finish time.
+Whisper always runs chunked — at every length, with no flag to set. `get_transcript.py` cuts the audio into 5-minute spans, transcribes several at once (one process leaves the GPU mostly idle; three is several times the throughput), offsets each chunk's timestamps back onto the source timeline, and caches every finished chunk. So no run outlives a command timeout, and one that gets killed resumes for free.
 
-For anything longer than ~10 minutes, use `transcribe_chunked.py` rather than a single pass. It splits with ffmpeg, transcribes chunks in parallel, offsets each chunk's timestamps back onto the original timeline, and caches every finished chunk — so no single command outlives its timeout, and an interrupted run resumes for free.
+**Every bug this plugin has had lived at a chunk boundary, and every one of them was silent.** Two separate mechanisms are needed, and it is easy to think the first is the whole story.
+
+**The pad.** A chunk's audio window runs 10 seconds past the span it leads on, at both ends. A cut lands mid-word about as often as not, and Whisper handed audio that starts halfway through a syllable will invent a word or drop one. Hard-cutting a 6-minute excerpt at five points lost `比如说` and `反正你`, split `他就很 | 容易对吧` across two lines, and said `对吧` twice — five seams, five wounds, exit code 0.
+
+**The cursor.** The pad alone is not enough, and believing otherwise cost this plugin a whole rewrite. Adjacent chunks decode their shared boundary region *independently and disagree about where a segment starts*: chunk 4 hears a sentence beginning at 300.9s, chunk 5 hears the same speech beginning at 299.0s. Ask each chunk "does this segment start inside my span?" against a boundary at 300.0s and **both answer no** — chunk 4 says it belongs to chunk 5, chunk 5 says it belongs to chunk 4, and the sentence is gone. That is not hypothetical: it deleted "还有一个概念叫低频、中频和高频" from a vocal-technique lecture, the sentence the rest of the lesson is built on, while the header cheerfully reported `COVERAGE: 1.00`. So the merge stitches with a cursor instead: a segment is taken whenever it ends past the last moment already transcribed. Audio can be transcribed twice — never zero times.
+
+`scripts/test_get_transcript.py` locks both. `test_boundary_handover` replays the exact timestamps that produced that drop; revert the merge and it fails.
 
 ## Skills
 
@@ -63,4 +69,4 @@ For anything longer than ~10 minutes, use `transcribe_chunked.py` rather than a 
 ## Notes
 
 - **Bilibili needs cookies.** Export them to `~/.claude/my-auth/cookies-bilibili.txt`; without them every download fails with HTTP 412. `/video-dl-setup` explains how.
-- **Speech recognition output is not ground truth.** Homophone errors are common, especially in Chinese and on domain jargon. When a transcript line carries weight, check it against the source — the timestamps are there so you can.
+- **Speech recognition output is not ground truth.** Homophone errors are common, especially in Chinese and on domain jargon — a vocal-technique lecture in this repo's own test material has 声带 ("vocal folds") transcribed as 生态 ("ecology") throughout. The `COVERAGE` header does not see this and never will: it measures how completely the transcript spans the audio, not whether the words are right. Only `SOURCE` tells you a machine wrote it. When a line carries weight, check it against the audio — the timestamps are there so you can.

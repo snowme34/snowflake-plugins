@@ -68,9 +68,15 @@ Set paths:
 Invoke `learn-everything:video-dl-transcribe` skill:
 `SOURCE --output TRANSCRIPT_PATH [--lang LANG] [--cookies PATH]`
 
-Read QUALITY from transcript header. The skill already defaults to `large-v3`, so a low score
-usually means bad audio, not a weak model — re-invoke only if the transcript used a smaller model:
-`SOURCE --output TRANSCRIPT_PATH [--lang LANG] [--whisper-model large-v3] [--cookies PATH]`
+Read `COVERAGE` and `WARN` from the transcript header. COVERAGE is how much of the audio the
+transcript accounts for, not how correct the words are — never treat a high score as accuracy.
+
+A `WARN` on a transcript that was written is not a retry signal. Every chunk was transcribed; the
+warning names a stretch of audio that produced no text, which means that stretch has no speech in
+it. Note it for the user and keep going — re-running only spends the same minutes to get the same
+answer.
+
+Over music or sung/vocalised passages the transcript is most likely garbage — treat it as unreliable.
 
 **→ Do not stop. Continue immediately to 4.2.**
 

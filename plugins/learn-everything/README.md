@@ -37,14 +37,14 @@ Transcription picks its backend automatically:
 
 | Platform | Backend | Throughput (large-v3) |
 |---|---|---|
-| Apple Silicon | `mlx-whisper` (Metal GPU) | ~3x realtime per process, ~3 processes at once |
+| Apple Silicon | `mlx-whisper` (Metal GPU) | ~3x realtime, one process by default |
 | Everything else | `faster-whisper` (CPU) | ~0.8x realtime, single process (it already uses every core) |
 
 **Dense speech is much slower than sparse speech of the same length.** Whisper decodes token by token, so an hour of a talkative lecturer costs far more than an hour of a recording with pauses and music. Measure before promising anyone a finish time.
 
 ### Chunking
 
-Whisper always runs chunked — at every length, with no flag to set. `get_transcript.py` cuts the audio into 5-minute spans, transcribes several at once (one process leaves the GPU mostly idle; three is several times the throughput), offsets each chunk's timestamps back onto the source timeline, and caches every finished chunk. So no run outlives a command timeout, and one that gets killed resumes for free.
+Whisper always runs chunked — at every length, with no flag to set. `get_transcript.py` cuts the audio into 5-minute spans, transcribes them one at a time, offsets each chunk's timestamps back onto the source timeline, and caches every finished chunk. Chunking is not for speed — it is what keeps a run from outliving a command timeout and lets a killed run resume for free. Parallelism is a separate, opt-in thing (`--workers`): more processes do raise throughput, but each holds its own ~2.9GB copy of the weights in unified memory, so the default is one — three on a 16GB Mac is how you thrash it into swap.
 
 **Every bug this plugin has had lived at a chunk boundary, and every one of them was silent.** Two separate mechanisms are needed, and it is easy to think the first is the whole story.
 

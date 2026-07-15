@@ -27,6 +27,10 @@ Two separate mechanisms keep a chunk boundary from eating words, and they are ea
 
 Backend picks itself: mlx-whisper (Metal GPU) on Apple Silicon, else faster-whisper (CPU).
 
+One chunk is transcribed at a time. Each parallel worker is a separate process holding its own
+copy of the weights, so more than one multiplies memory; parallelism is therefore opt-in
+(`--workers`), never a default. See DEFAULT_WORKERS.
+
 Usage:
   get_transcript.py <URL_OR_FILE> [--output PATH] [--lang LANG] [--model MODEL]
                     [--backend auto|mlx|faster] [--force-whisper] [--cookies PATH]
@@ -82,6 +86,10 @@ DEFAULT_MODEL = "large-v3"
 DEFAULT_CHUNK_MINUTES = 5.0
 MIN_CHUNK_SECONDS = 60.0
 
+# Upper bound on the chunk count, so a bogus or hostile duration cannot fan out into millions of
+# ffmpeg cuts and Whisper processes. At the 5-minute default this is more than a week of audio.
+MAX_CHUNKS = 2000
+
 # Each chunk's audio window runs this far past its span at both ends, so that a word lying on
 # a cut is still heard whole by the chunk that transcribes it. Whisper's own segments run well
 # under 10s on speech, so this is comfortably longer than anything it has to swallow.
@@ -96,12 +104,14 @@ CACHE_FORMAT = 2
 # Anything longer is audio the transcript does not explain, and COVERAGE says so.
 PAUSE_TOLERANCE_SECONDS = 5.0
 
-# One Whisper process spends most of its time waiting on Python, not on the GPU; a few in
-# parallel multiply throughput. Past ~4 they start fighting over memory bandwidth.
-MLX_WORKERS = 3
-# faster-whisper already spreads a single transcription across every core. A second process
-# would only contend with the first.
-FASTER_WORKERS = 1
+# One worker, both backends. faster-whisper already spreads a single transcription across every
+# core, so a second process would only contend. mlx *could* run chunks in parallel for a modest
+# speed-up — decoding idles the GPU between tokens — but each worker is a `spawn`ed process with its
+# own copy of the weights (large-v3's are 2.9GB, one blob, verified on disk) in unified memory the
+# GPU will not let the kernel page out, so N workers cost N × 2.9GB resident. That trade is the
+# caller's to make against the RAM they have free (`--workers`), never a default. Parallel mlx is
+# the one real head-room here, and it is deliberately left off — not the plugin's point.
+DEFAULT_WORKERS = 1
 
 # mlx-whisper takes an HF repo, not a size name.
 _MLX_REPOS = {
@@ -126,6 +136,13 @@ _URL_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 # that genuinely recurs later ("right", "对") gets deleted as a duplicate of an unrelated one
 # from minutes ago.
 ROLLING_HORIZON_SECONDS = 30.0
+
+# A hard ceiling on that same look-back, in cues rather than seconds. With monotonic timestamps the
+# horizon bounds the scan first, so for real captions this never binds; it exists only for the
+# adversarial case where every cue is pinned to one timestamp, defeating the horizon and forcing an
+# O(n²) rescan. Set well above the densest real rolling window (a few cues per second over 30s is
+# under a hundred) and no higher, so the attacker's rescan is capped as tightly as possible.
+ROLLING_SCAN_LIMIT = 256
 
 # A Whisper segment is one breath group, and a breath group is about this long once written
 # down. Chinese fits a clause into ~8 characters where English needs ~35. Scoring both against
@@ -160,8 +177,7 @@ def pick_backend(requested: str) -> str:
     return "faster"
 
 
-def default_workers(backend: str) -> int:
-    return MLX_WORKERS if backend == "mlx" else FASTER_WORKERS
+# ---------------------------------------------------------------- whisper
 
 
 def _transcribe_mlx(audio: str, lang: str | None, model: str) -> dict:
@@ -265,6 +281,15 @@ class Chunk:
 
 def plan_chunks(duration: float, chunk_seconds: float) -> list[Chunk]:
     n = max(1, math.ceil(duration / chunk_seconds))
+    # duration comes from ffprobe reading the file, so a corrupt container or a hostile source can
+    # make it enormous. This list comprehension materialises all n Chunks at once, and transcribe_all
+    # then stats a cache file for each; at n in the millions that alone exhausts memory and floods
+    # the filesystem before a single chunk is cut. Real media never approaches MAX_CHUNKS (over a
+    # week of audio at the 5-minute default), so a duration that does is a fault worth stopping on.
+    if n > MAX_CHUNKS:
+        die(f"{fmt_ts(duration)} of audio is {n} chunks of {chunk_seconds / 60:g}min — over the "
+            f"{MAX_CHUNKS}-chunk ceiling. Raise --chunk-minutes, or check the source is not "
+            f"misreporting its duration.")
     return [
         Chunk(
             index=i,
@@ -460,6 +485,24 @@ def fetch_metadata(url: str, cookies: str | None) -> dict:
         die(f"yt-dlp returned no usable metadata for {url}")
 
 
+# A caption table is keyed by language codes the remote feed chose, and the chosen key flows
+# verbatim into a `--sub-langs` argument and a `sub.<key>.vtt` filename. A hostile or careless feed
+# can put anything there — `-J,en,all` to smuggle flags, `../../etc/passwd` to escape the temp dir,
+# a newline to forge a log line. A real code is BCP-47: alphanumeric groups joined by single
+# hyphens, never leading with one. Everything else is dropped before selection, so a bad key can
+# neither be picked nor reach a subprocess, and the run falls through to Whisper — the right answer
+# for a track that cannot be named. The internet is not assumed friendly.
+_SAFE_LANG_RE = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$")
+
+
+def is_safe_lang(code: str) -> bool:
+    return isinstance(code, str) and bool(_SAFE_LANG_RE.match(code))
+
+
+def _safe_langs(table: dict) -> dict:
+    return {k: v for k, v in table.items() if is_safe_lang(k)}
+
+
 def _match_lang(table: dict, want: str) -> str | None:
     """Find `want` in a yt-dlp caption table, tolerating regional suffixes (zh → zh-Hans)."""
     if want in table:
@@ -476,8 +519,8 @@ def pick_caption_lang(meta: dict, requested: str | None) -> tuple[str, bool] | N
     so Whisper transcribes what is actually being said, rather than handing back an English
     transcript under a `LANG: ja` header.
     """
-    manual = {k: v for k, v in (meta.get("subtitles") or {}).items() if k != "live_chat"}
-    auto = meta.get("automatic_captions") or {}
+    manual = _safe_langs({k: v for k, v in (meta.get("subtitles") or {}).items() if k != "live_chat"})
+    auto = _safe_langs(meta.get("automatic_captions") or {})
 
     if requested:
         human = _match_lang(manual, requested)
@@ -494,6 +537,12 @@ def pick_caption_lang(meta: dict, requested: str | None) -> tuple[str, bool] | N
 
 
 def fetch_captions(url: str, lang: str, cookies: str | None) -> list[tuple[float, float, str]] | None:
+    # The boundary right before the subprocess. pick_caption_lang already filters the tables, but a
+    # language code is about to become a command-line argument and a filename, so it is checked once
+    # more here where it actually crosses into yt-dlp — no unvalidated remote string gets that far.
+    if not is_safe_lang(lang):
+        print(f"INFO: ignoring caption track with an unsafe language code {lang!r}", file=sys.stderr)
+        return None
     with tempfile.TemporaryDirectory() as tmp:
         try:
             r = _yt_dlp(
@@ -534,6 +583,38 @@ def download_audio(url: str, cache: Path, cookies: str | None) -> Path:
 # ---------------------------------------------------------------- VTT
 
 
+def strip_tags(s: str) -> str:
+    """Remove `<...>` cue tags in one linear pass — exactly what `re.sub(r"<[^>]+>", "", s)` does.
+
+    The regex is replaced because it is O(n²) on adversarial input: a cue body of many `<` with no
+    `>` makes the engine rescan to end-of-string from every `<`, so a crafted VTT — which a remote
+    server is free to return — turns a sub-megabyte download into minutes of pinned CPU before any
+    audio is fetched.
+
+    Matching the regex's semantics matters as much as the speed. `<[^>]+>` needs a closing `>` and
+    at least one character inside, so a bare `<` with no `>` after it (an ordinary "x < 100") and an
+    empty `<>` are *not* tags — the regex leaves them in place, and so must this. Dropping them was a
+    real bug: it silently truncated any subtitle line containing a less-than sign. The one expensive
+    scan (`find` returning -1) happens at most once, because past it there is no `>` left to find, so
+    this stays O(n).
+    """
+    out: list[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        if s[i] == "<":
+            close = s.find(">", i + 1)
+            if close == -1:
+                out.append(s[i:])  # no `>` anywhere after: the rest is literal, as the regex left it
+                break
+            if close > i + 1:  # a real `<...>` with content between the brackets
+                i = close + 1
+                continue
+            # close == i + 1 is an empty `<>`, which `[^>]+` does not match — keep the `<`.
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
 def parse_vtt(text: str) -> list[tuple[float, float, str]]:
     cue = re.compile(
         r"(\d{1,2}):(\d{2}):(\d{2})\.(\d{3})\s+-->\s+(\d{1,2}):(\d{2}):(\d{2})\.(\d{3})"
@@ -548,7 +629,7 @@ def parse_vtt(text: str) -> list[tuple[float, float, str]]:
     def flush() -> None:
         if span is None or not parts:
             return
-        cleaned = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", " ".join(parts))).strip()
+        cleaned = re.sub(r"\s+", " ", strip_tags(" ".join(parts))).strip()
         if cleaned:
             cues.append((span[0], span[1], cleaned))
 
@@ -576,10 +657,17 @@ def collapse_rolling(cues: list[tuple[float, float, str]]) -> list[tuple[float, 
     result: list[tuple[float, float, str]] = []
     for start, end, text in cues:
         absorbed = False
+        # The horizon normally bounds this look-back to a couple of seconds of cues. But the start
+        # times come from the remote VTT: pin every cue to 00:00:00 and the horizon never trips, so
+        # each new cue rescans the whole accumulated list and a crafted file drives this O(n²). The
+        # scan count is capped too — no genuine rolling window holds this many cues — so a malicious
+        # timeline cannot turn dedup into a denial of service.
+        scanned = 0
         for i in range(len(result) - 1, -1, -1):
-            prev_start, prev_end, prev_text = result[i]
-            if start - prev_start > ROLLING_HORIZON_SECONDS:
+            if start - result[i][0] > ROLLING_HORIZON_SECONDS or scanned >= ROLLING_SCAN_LIMIT:
                 break
+            scanned += 1
+            prev_start, prev_end, prev_text = result[i]
             if text in prev_text:
                 absorbed = True
                 break
@@ -701,9 +789,10 @@ def main() -> None:
     parser.add_argument("--chunk-minutes", type=float, default=DEFAULT_CHUNK_MINUTES,
                         help=f"Length of one Whisper chunk (default: {DEFAULT_CHUNK_MINUTES:g})")
     parser.add_argument("--workers", type=int, default=None,
-                        help=f"Chunks transcribed at once (default: {MLX_WORKERS} on mlx, "
-                             f"{FASTER_WORKERS} on faster-whisper). Each worker holds its own copy "
-                             "of the model in memory (~1.6GB for large-v3).")
+                        help=f"Chunks transcribed at once (default: {DEFAULT_WORKERS}). Each worker is "
+                             "a separate process with its own copy of the weights — ~2.9GB for "
+                             "large-v3, in unified memory the GPU will not let the kernel page out. "
+                             "Raise it only on a machine with RAM to spare.")
     args = parser.parse_args()
 
     chunk_seconds = args.chunk_minutes * 60
@@ -716,7 +805,7 @@ def main() -> None:
     kind = classify_source(args.source)
     output = Path(args.output) if args.output else None
     backend = pick_backend(args.backend)
-    workers = args.workers or default_workers(backend)
+    workers = args.workers or DEFAULT_WORKERS
 
     title = Path(args.source).stem if kind == "file" else ""
     duration = 0.0

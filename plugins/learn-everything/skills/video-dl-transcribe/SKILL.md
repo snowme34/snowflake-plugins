@@ -52,6 +52,10 @@ PY
 `ffmpeg` or `whisper` missing → stop, tell the user to run `learn-everything:video-dl-setup`.
 `yt_dlp` missing → only a problem if INPUT is a URL.
 
+A YouTube video that reports **no caption tracks at all** simply has none — the uploader turned
+them off. That is not a broken setup and there is nothing to fix; it means Whisper, and Whisper
+means minutes. Tell the user that is why it is slow, rather than going looking for a bug.
+
 ## Step 3: Pick VIDEO_ID and the output path
 
 - YouTube: the `v=` param, or the last path segment of a `youtu.be/` URL

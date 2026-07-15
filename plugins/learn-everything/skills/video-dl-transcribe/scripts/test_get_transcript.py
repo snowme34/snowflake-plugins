@@ -10,20 +10,25 @@ transcript with a hole in it. That is what test_boundary_handover exists for, an
 test here that has already caught a real bug rather than being written after the fact.
 """
 import random
+import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from get_transcript import (
+    MAX_CHUNKS,
     Chunk,
     assess_coverage,
     cache_dir_for,
     collapse_rolling,
     header_text,
+    is_safe_lang,
     merge_chunks,
     parse_vtt,
     pick_caption_lang,
     plan_chunks,
+    strip_tags,
 )
 
 
@@ -133,6 +138,76 @@ def test_parse_vtt():
     assert parse_vtt(vtt) == [(1.5, 5.25, "hello there world")]
 
 
+def test_strip_tags_matches_the_regex_it_replaced():
+    """strip_tags exists only to be a faster `re.sub(r"<[^>]+>", "", s)`. It must agree with it.
+
+    The regex removes `<...>` but leaves a bare `<` (an ordinary "x < 100") and an empty `<>` alone,
+    because `<[^>]+>` needs a closing `>` and a character inside. An earlier linear rewrite dropped
+    everything after an unmatched `<`, silently truncating any subtitle line with a less-than sign —
+    green tests and all, because the test asserted the buggy output. This pins the two together on a
+    battery of exactly the inputs that distinguish them.
+    """
+    reference = lambda s: re.sub(r"<[^>]+>", "", s)  # noqa: E731 — the thing being matched
+    cases = [
+        "<c>hi</c>", "a<00:00:01.000>b", "plain",
+        "no<close",                       # bare `<`, no `>` after — must stay whole
+        "the price is < 100 dollars",     # the real-world regression
+        "<>", "a<>b",                     # empty tag — not a tag
+        "a<b>c<d", "<a<b>", "x < y > z",  # mixed brackets, first `>` wins
+        ">leading", "trailing<", "",      # degenerate
+    ]
+    for s in cases:
+        assert strip_tags(s) == reference(s), \
+            f"strip_tags disagrees with the regex on {s!r}: {strip_tags(s)!r} vs {reference(s)!r}"
+
+
+def test_strip_tags_is_linear():
+    """A cue of many `<` with no `>` is what makes the regex O(n²). strip_tags must not blow up.
+
+    Three shapes, each 2M chars: all `<` and `<`-heavy input hit the no-`>` short-circuit at once,
+    while all-literal `"a"*n` is the input that actually runs the character-copy loop to the end —
+    the worst case for the linear path itself. The regex takes tens of seconds on the first; a
+    linear scan stays in the low tens of milliseconds on all three.
+    """
+    for payload in ("<" * 2_000_000, "a" * 2_000_000, "<a" * 1_000_000):
+        t = time.perf_counter()
+        strip_tags(payload)
+        assert time.perf_counter() - t < 1.0, \
+            "strip_tags is not linear — the O(n²) blow-up is back"
+
+
+def test_collapse_rolling_survives_a_pinned_timeline():
+    """collapse_rolling's look-back is horizon-bounded — but the remote VTT sets the timestamps.
+
+    Pin every cue to 00:00:00 and the horizon never trips, so without the ROLLING_SCAN_LIMIT cap
+    each cue rescans the whole list and the pass goes O(n²) (measured ~8s at this size uncapped).
+    The invariant, not a stopwatch, is the real assertion: capped work is O(n·limit), so 20k
+    pinned cues must stay far under the uncapped quadratic — and, since none of these lines is a
+    substring of another, every one must survive. The generous time bound only guards against the
+    cap being removed; the length check guards against it corrupting the result.
+    """
+    # Equal-length distinct strings: none can be a substring of another, so the correct result
+    # keeps all 20k. (Varying-length lines like "line 1" / "line 12" would absorb legitimately and
+    # muddle the check.) Every cue at 00:00:00 defeats the horizon, exercising the scan cap.
+    cues = [(0.0, 1.0, f"{i:08d}") for i in range(20_000)]
+    t = time.perf_counter()
+    out = collapse_rolling(cues)
+    elapsed = time.perf_counter() - t
+    assert len(out) == len(cues), "the scan cap dropped distinct lines it should have kept"
+    assert elapsed < 4.0, f"a pinned-timeline VTT drove collapse_rolling quadratic ({elapsed:.1f}s)"
+
+
+def test_plan_chunks_refuses_an_absurd_duration():
+    """A bogus or hostile duration must not fan out into a million ffmpeg cuts and processes."""
+    assert len(plan_chunks(MAX_CHUNKS * 300.0, 300.0)) == MAX_CHUNKS, "the ceiling itself must run"
+    try:
+        plan_chunks((MAX_CHUNKS + 1) * 300.0, 300.0)
+    except SystemExit:
+        pass
+    else:
+        assert False, "plan_chunks did not stop past the chunk ceiling"
+
+
 def test_caption_language_is_never_substituted():
     meta = {"subtitles": {"en": [{}]}, "automatic_captions": {"en": [{}]}, "language": "en"}
     assert pick_caption_lang(meta, "ja") is None, "handed back English captions for --lang ja"
@@ -141,6 +216,27 @@ def test_caption_language_is_never_substituted():
     auto_only = {"subtitles": {}, "automatic_captions": {"zh-Hans": [{}]}, "language": "zh"}
     assert pick_caption_lang(auto_only, None) == ("zh-Hans", True), \
         "auto-captions must be reported as machine-made"
+
+
+def test_hostile_caption_language_codes_are_dropped():
+    """The caption-table keys are remote-controlled and flow into argv and a filename. Reject them.
+
+    A malicious feed can key a track by `-J,en,all` (smuggle flags), `../../etc/passwd` (escape the
+    temp dir), or a newline (forge a log line). None may be selected, and a real code sitting beside
+    them still must be. The internet is not assumed friendly.
+    """
+    hostile = ["../../../../etc/passwd", "-J,en,all", "en; rm -rf /", "e n", "en\nWARN: x", "", "."]
+    for bad in hostile:
+        assert not is_safe_lang(bad), f"unsafe code slipped through: {bad!r}"
+        meta = {"subtitles": {bad: [{}]}, "automatic_captions": {}, "language": bad}
+        assert pick_caption_lang(meta, None) is None, f"a hostile code was selected: {bad!r}"
+
+    for good in ["en", "zh-Hans", "en-US", "pt-BR", "zh-Hant-HK", "en-orig"]:
+        assert is_safe_lang(good), f"a legitimate code was rejected: {good!r}"
+
+    # A real track beside a hostile one is still reachable — the filter drops only the bad key.
+    mixed = {"subtitles": {"../evil": [{}], "zh-Hans": [{}]}, "automatic_captions": {}}
+    assert pick_caption_lang(mixed, "zh") == ("zh-Hans", False), "the good track was lost with the bad"
 
 
 def test_header_cannot_be_injected():

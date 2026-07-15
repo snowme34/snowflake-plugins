@@ -73,6 +73,11 @@ fi
 ffmpeg -version 2>&1 | head -1
 ```
 
+yt-dlp warns that it has no JavaScript runtime and that "some formats may be missing". Leave it
+be. It concerns *formats* — the audio and video streams — and the audio this venv downloads still
+comes through. It has **nothing to do with subtitles**: captions resolve without a JS runtime, and
+a video reporting no caption tracks genuinely has none.
+
 ## Step 6: Bilibili setup (optional)
 
 Bilibili requires authentication cookies. If you need Bilibili support:

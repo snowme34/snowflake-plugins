@@ -1,12 +1,6 @@
 ---
 name: proof-read
 description: Proofread a markdown document in four passes, editing the file directly. Use when the user asks to proofread, review, or check a markdown document — blog posts, stories, notes, or any prose.
-triggers:
-  - proofread
-  - proof read
-  - proof-read
-  - review document
-  - check my writing
 ---
 
 # Proof Read

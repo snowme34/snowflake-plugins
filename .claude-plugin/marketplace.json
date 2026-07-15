@@ -16,6 +16,11 @@
       "name": "learn-everything",
       "source": "./plugins/learn-everything",
       "description": "Turn any video, audio, or text into structured learning notes. Transcribes with GPU-accelerated Whisper, splits into semantic chapters with exact timestamps, and distills active-recall takeaways."
+    },
+    {
+      "name": "adversarial-review",
+      "source": "./plugins/adversarial-review",
+      "description": "Adversarially review anything — code, docs, design, config. One independent subagent per round, each with an opposing bias: hunt defects, delete, doubt assumptions, consume it, attack it. Executed evidence over speculation, findings grouped by round."
     }
   ]
 }

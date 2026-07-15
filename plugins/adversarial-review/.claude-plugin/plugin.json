@@ -1,0 +1,5 @@
+{
+  "name": "adversarial-review",
+  "description": "Adversarial review of anything — code, docs, design, config. One independent subagent per round, each with an opposing bias: hunt defects, delete, doubt assumptions, consume it, attack it. Demands executed evidence, reports grouped by round.",
+  "version": "1.0.0"
+}
